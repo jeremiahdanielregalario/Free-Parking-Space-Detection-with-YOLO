@@ -2,51 +2,35 @@ import streamlit as st
 from ultralytics import YOLO
 import numpy as np
 from PIL import Image
-import os
-import tempfile
-import zipfile
-import glob
+import io
 import pandas as pd
 import torch
-import io
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 
 MODEL_PATH = "model.pt" 
-CLASS_MAP_OVERRIDE = None  
-MAX_SHOW_IMAGES = 20 # for zip
 
-# Functions
+# -------------------------------
+# Utility Functions
+# -------------------------------
 def device_str():
     return "0" if torch.cuda.is_available() else "cpu"
 
 def load_yolo_model(path):
-    model = YOLO(path)
-    return model
+    return YOLO(path)
 
 def results_to_detections(results):
-    res = results
-    boxes = getattr(res, "boxes", None)
+    boxes = getattr(results, "boxes", None)
     if boxes is None:
         return []
-    try:
-        xyxy = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, "cpu") else np.array(boxes.xyxy)
-        confs = boxes.conf.cpu().numpy() if hasattr(boxes.conf, "cpu") else np.array(boxes.conf)
-        cls_ids = boxes.cls.cpu().numpy().astype(int) if hasattr(boxes.cls, "cpu") else np.array(boxes.cls).astype(int)
-    except Exception:
-        # Fallback robust extraction
-        xyxy = np.array(boxes.xyxy)
-        confs = np.array(boxes.conf)
-        cls_ids = np.array(boxes.cls).astype(int)
+    xyxy = boxes.xyxy.cpu().numpy()
+    confs = boxes.conf.cpu().numpy()
+    cls_ids = boxes.cls.cpu().numpy().astype(int)
 
     detections = []
     for i in range(len(confs)):
         cid = int(cls_ids[i])
-        name = None
-        try:
-            name = res.names[cid] if hasattr(res, "names") and cid in res.names else None
-        except Exception:
-            name = None
-        if CLASS_MAP_OVERRIDE and cid in CLASS_MAP_OVERRIDE:
-            name = CLASS_MAP_OVERRIDE[cid]
+        name = results.names.get(cid, f"class_{cid}")
         detections.append({
             "class_id": cid,
             "class_name": name,
@@ -57,259 +41,296 @@ def results_to_detections(results):
 
 def annotate_from_result(results):
     try:
-        annotated = results.plot()  # returns numpy (RGB)
-        return annotated
+        return results.plot()
     except Exception:
-        try:
-            return results.orig_img
-        except Exception:
-            return None
+        return getattr(results, "orig_img", None)
 
-def infer_on_image(model, pil_img, conf_threshold=0.25, device=None):
-    img_np = np.array(pil_img)  # RGB numpy array
-    dev = device if device is not None else device_str()
+def infer_on_image(model, pil_img):
+    img_np = np.array(pil_img)
+    results = model.predict(source=img_np, device=device_str(), save=False, verbose=False)
+    if not results:
+        return False, 0.0, [], None
 
-    results = model.predict(source=img_np, device=dev, save=False, verbose=False)
-    if not results or len(results) == 0:
-        return False, 0.0, [], None, None
     res0 = results[0]
     detections = results_to_detections(res0)
-    max_conf = max([d["conf"] for d in detections], default=0.0)
-    occupied = any(d["conf"] >= conf_threshold for d in detections)
     annotated = annotate_from_result(res0)
-    return occupied, max_conf, detections, annotated, res0
 
+    # Determine occupancy based on the most confident detection
+    max_conf = max([d["conf"] for d in detections], default=0.0)
+    occupied = len(detections) > 0  # occupied if any detection exists
 
-# Streamlit
-st.set_page_config(page_title="Free Parking Space Detector", layout="wide")
-st.title("🚗 Free Parking Space Detector")
+    return occupied, max_conf, detections, annotated
 
-# Sidebar
-with st.sidebar:
-    st.header("Welcome!")
-    st.markdown("This app **utilizes** a pre-trained `model.pt` from the an online dataset.")
-    st.markdown("---")
-    conf_threshold = st.slider("Detection confidence threshold", 0.0, 1.0, 0.25, 0.01)
-    show_boxes_table = st.checkbox("Show detection table per image", value=True)
-    show_annotated = st.checkbox("Show annotated images", value=True)
-    st.markdown("---")
-    st.markdown(f"Device detected: **{'GPU' if torch.cuda.is_available() else 'CPU'}**")
+# -------------------------------
+# Streamlit Setup
+# -------------------------------
+st.set_page_config(page_title="Smart Parking Detector", layout="wide")
 
-# Ensure model exists
-if not os.path.exists(MODEL_PATH):
-    st.error(f"Default model file not found at `{MODEL_PATH}`. Place your `model.pt` in the same folder as `app.py`.")
-    st.stop()
-
-# Load model
 @st.cache_resource(show_spinner=False)
 def _load_model_cached(path):
     return load_yolo_model(path)
 
 model = _load_model_cached(MODEL_PATH)
 
-# show model task 
-try:
-    model_task = model.task if hasattr(model, "task") else "detect"
-except Exception:
-    model_task = "detect"
-st.sidebar.write(f"Model task: **{model_task}**")
+# Initialize session state
+if "parking_data" not in st.session_state:
+    st.session_state["parking_data"] = {
+        "Lot 1": {"spaces": [], "reservations": {}, "last_detection": None},
+        "Lot 2": {"spaces": [], "reservations": {}, "last_detection": None},
+        "Lot 3": {"spaces": [], "reservations": {}, "last_detection": None}
+    }
 
-try:
-    names = model.names if hasattr(model, "names") else None
-    if names:
-        st.sidebar.write(f"Model has {len(names)} class names.")
-except Exception:
-    names = None
+if "detection_results" not in st.session_state:
+    st.session_state["detection_results"] = {
+        "Lot 1": {"occupied": False, "max_conf": 0.0, "annotated": None, "timestamp": None},
+        "Lot 2": {"occupied": False, "max_conf": 0.0, "annotated": None, "timestamp": None},
+        "Lot 3": {"occupied": False, "max_conf": 0.0, "annotated": None, "timestamp": None}
+    }
 
-# Main columns
-col_left, col_right = st.columns([1, 1])
+tab1, tab2 = st.tabs(["🧠 Detection", "🅿️ Reservation"])
 
-with col_left:
-    st.subheader("Input")
-    uploaded_image = st.file_uploader("Upload an image (jpg/png)", type=["jpg", "jpeg", "png"])
-    use_cam = st.checkbox("Use webcam (camera)", value=False)
-    if use_cam:
-        cam_img = st.camera_input("Take a photo")
-    else:
-        cam_img = None
+# -------------------------------
+# TAB 1: Detection
+# -------------------------------
+with tab1:
+    st.title("🚗 Free Parking Space Detector")
 
-    uploaded_zip = st.file_uploader("Or upload a ZIP dataset (images inside)", type=["zip"])
-
-with col_right:
-    st.subheader("Results")
-    result_area = st.empty()
-
-# process image
-def process_and_display(pil_img, label=None):
-    occupied, max_conf, dets, annotated, raw = infer_on_image(model, pil_img, conf_threshold, device=device_str())
-    status = "occupied" if occupied else "empty"
-    # header
-    header = f"Prediction: **{status}**  —  max_conf: {max_conf:.3f}"
-    if label:
-        header = f"{label}  |  " + header
-    with result_area.container():
-        st.markdown(header)
-        if show_annotated and annotated is not None:
-            st.image(annotated, use_container_width=True)
-        if show_boxes_table and dets:
-            df = pd.DataFrame(dets)
-            # Beautify class_name column if none
-            if df["class_name"].isnull().any() and names:
-                df["class_name"] = df["class_id"].apply(lambda x: names[int(x)] if int(x) in names else None)
-            st.dataframe(df)
-
-    return {"prediction": status, "max_conf": max_conf, "detections": dets, "annotated": annotated}
-
-# Single upload or camera
-if cam_img:
-    pil = Image.open(io.BytesIO(cam_img.getvalue())).convert("RGB")
-    process_and_display(pil, label="webcam")
-elif uploaded_image:
-    pil = Image.open(io.BytesIO(uploaded_image.read())).convert("RGB")
-    process_and_display(pil, label=uploaded_image.name)
-
-
-# ZIP dataset processing
-if uploaded_zip:
-    tmpdir = tempfile.mkdtemp()
-    with zipfile.ZipFile(uploaded_zip) as z:
-        z.extractall(tmpdir)
-    # find images
-    files = []
-    for root, _, fnames in os.walk(tmpdir):
-        for f in fnames:
-            if f.lower().endswith((".jpg", ".jpeg", ".png")):
-                files.append(os.path.join(root, f))
-    files = sorted(files)
-    st.info(f"Extracted ZIP: {len(files)} images found.")
-
-    if st.button("Run YOLO on ZIP dataset"):
-        rows = []
-        progress = st.progress(0)
-        zip_results = []
-        for i, p in enumerate(files):
-            pil = Image.open(p).convert("RGB")
-            # infer directly (no display)
-            occupied, max_conf, dets, annotated, raw = infer_on_image(model, pil, conf_threshold, device=device_str())
-            status = "occupied" if occupied else "empty"
-            classes = []
-            for d in dets:
-                cname = d.get("class_name") if d.get("class_name") is not None else str(d.get("class_id"))
-                classes.append(str(cname))
-            row = {
-                "file": os.path.basename(p),
-                "prediction": status,
-                "max_conf": max_conf,
-                "num_detections": len(dets),
-                "classes": ",".join(classes) if classes else "",
-                "detections": dets,
-                "annotated": annotated,
-                "src_path": p
-            }
-            rows.append(row)
-            zip_results.append(row)
-            progress.progress((i + 1) / len(files))
-            if i+1 >= MAX_SHOW_IMAGES:
-                st.info(f"Processed first {MAX_SHOW_IMAGES} images. Full CSV available for download.")
-
-        df = pd.DataFrame(rows)
-
-        # store results 
-        st.session_state["zip_results"] = zip_results
-        st.session_state["zip_idx"] = 0  # start index
-
-        # Summary
-        st.markdown("## Dataset Summary")
-        if len(df) == 0:
-            st.warning("No images processed.")
-        else:
-            # Group by prediction
-            summary = df.groupby("prediction").agg(
-                count=("file", "count"),
-                avg_conf=("max_conf", "mean"),
-                avg_detections=("num_detections", "mean")
-            ).reset_index()
-            summary["percentage"] = (summary["count"] / len(df) * 100).round(2)
-            # Display summary table
-            st.markdown("### Occupancy summary")
-            st.dataframe(summary)
-
-            # Top detected classes across all images
-            all_classes = (
-                df["classes"]
-                .replace("", np.nan)
-                .dropna()
-                .str.split(",")
-                .explode()
-                .reset_index(drop=True)
+    cols = st.columns(3)
+    for i, col in enumerate(cols, start=1):
+        lot_name = f"Lot {i}"
+        with col:
+            st.subheader(lot_name)
+            input_mode = st.radio(
+                f"Choose input method for {lot_name}:",
+                ["Upload Image", "Use Webcam"],
+                key=f"input_mode_{i}"
             )
-            if len(all_classes) > 0:
-                class_counts = all_classes.value_counts().reset_index()
-                class_counts.columns = ["class_name", "count"]
-                st.markdown("### Top detected classes")
-                st.dataframe(class_counts)
+
+            pil_img = None
+            if input_mode == "Upload Image":
+                uploaded_img = st.file_uploader(
+                    f"Upload image for {lot_name}",
+                    type=["jpg", "jpeg", "png"],
+                    key=f"file_{i}"
+                )
+                if uploaded_img:
+                    pil_img = Image.open(io.BytesIO(uploaded_img.read())).convert("RGB")
+
             else:
-                st.markdown("### Top detected classes")
-                st.write("No detections with class names were found in this dataset.")
+                cam_img = st.camera_input(f"Take photo for {lot_name}", key=f"cam_{i}")
+                if cam_img:
+                    pil_img = Image.open(io.BytesIO(cam_img.getvalue())).convert("RGB")
 
-        # download CSV
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download results CSV", csv, "results.csv")
+            if pil_img is not None and st.button(f"Run Detection for {lot_name}", key=f"detect_{i}"):
+                with st.spinner(f"Running YOLO detection for {lot_name}..."):
+                    occupied, max_conf, detections, annotated = infer_on_image(model, pil_img)
 
-    if "zip_results" in st.session_state and st.session_state.get("zip_results"):
-        results_list = st.session_state["zip_results"]
-        n = len(results_list)
-        # ensure index exists
-        if "zip_idx" not in st.session_state:
-            st.session_state["zip_idx"] = 0
+                    # Get previous reservations
+                    prev_spaces = st.session_state["parking_data"][lot_name]["spaces"]
+                    reservations = st.session_state["parking_data"][lot_name]["reservations"]
 
-        # Carousel controls
-        st.markdown("## Review Detection")
-        col_prev, col_idx, col_next = st.columns([1, 3, 1])
-        with col_prev:
-            if st.button("◀ Previous"):
-                st.session_state["zip_idx"] = max(0, st.session_state["zip_idx"] - 1)
-        with col_next:
-            if st.button("Next ▶"):
-                st.session_state["zip_idx"] = min(n - 1, st.session_state["zip_idx"] + 1)
+                    # First, let's debug what we're detecting
+                    st.write("🔍 DEBUG - What YOLO detected:")
+                    for i, det in enumerate(detections):
+                        st.write(f"Detection {i+1}: Class='{det['class_name']}', Confidence={det['conf']:.2f}")
 
-        # slider to jump to any image
-        st.session_state["zip_idx"] = st.slider("Jump to image index", 0, n-1, st.session_state["zip_idx"])
+                    # Assume lot has N total spaces
+                    TOTAL_SPACES = 21  # Change this to 21 if you want 21 spaces
+                    new_spaces = []
 
-        idx = st.session_state["zip_idx"]
-        entry = results_list[idx]
+                    # Get previous reservations
+                    reservations = st.session_state["parking_data"][lot_name]["reservations"]
 
-        # Show selected annotated image
-        st.markdown(f"### [{idx+1}/{n}] {entry['file']}")
-        if show_annotated and entry.get("annotated") is not None:
-            st.image(entry["annotated"], use_container_width=True)
+                    # Process each detection - respect what was actually detected
+                    for idx, det in enumerate(detections, start=1):
+                        if idx > TOTAL_SPACES:  # Don't exceed total spaces
+                            break
+                            
+                        # Determine status based on WHAT was detected
+                        if "empty" in det["class_name"].lower() or "free" in det["class_name"].lower():
+                            status = "empty"
+                        else:
+                            status = "occupied"  # Assume it's a vehicle
+                        
+                        # Reservations override detection
+                        if idx in reservations:
+                            status = "reserved"
+                        
+                        new_spaces.append({
+                            "id": idx,
+                            "status": status,  # This now matches the detection
+                            "conf": det["conf"],
+                            "class_name": det["class_name"]
+                        })
+
+                    # Fill remaining spaces as empty
+                    for idx in range(len(detections) + 1, TOTAL_SPACES + 1):
+                        if idx in reservations:
+                            status = "reserved"
+                        else:
+                            status = "empty"
+                        new_spaces.append({
+                            "id": idx,
+                            "status": status,
+                            "conf": 0.0,
+                            "class_name": None
+                        })
+
+                    # Store everything
+                    st.session_state["parking_data"][lot_name]["spaces"] = new_spaces
+                    st.session_state["parking_data"][lot_name]["last_detection"] = datetime.now()
+                    st.session_state["detection_results"][lot_name] = {
+                        "occupied": occupied,
+                        "max_conf": max_conf,
+                        "annotated": annotated,
+                        "timestamp": datetime.now()
+                    }
+
+            # Always show the latest annotated result
+            result = st.session_state["detection_results"][lot_name]
+            if result["annotated"] is not None:
+                timestamp_str = f" (Detected: {result['timestamp'].strftime('%H:%M:%S')})"
+                st.image(
+                    result["annotated"],
+                    caption=f"{lot_name}: {'Occupied' if result['occupied'] else 'Empty'} "
+                            f"(Most confident: {result['max_conf']:.2f}){timestamp_str}"
+                )
+                
+# -------------------------------
+# TAB 2: Reservation & Dashboard
+# -------------------------------
+with tab2:
+    st.title("🅿️ Parking Reservation Dashboard")
+
+    # Update reservation timers
+    for lot_name, data in st.session_state["parking_data"].items():
+        for space in data["spaces"]:
+            if space["status"] == "reserved":
+                res_info = data["reservations"].get(space["id"])
+                if res_info:
+                    remaining = (res_info["end_time"] - datetime.now()).total_seconds()
+                    if remaining <= 0:
+                        # Expired reservation → set to empty
+                        space["status"] = "empty"
+                        del data["reservations"][space["id"]]
+
+    # Compute per-lot summaries from the current spaces list
+    summaries = []
+    for lot_name, data in st.session_state["parking_data"].items():
+        spaces = data["spaces"]
+        if spaces:
+            # Count by status
+            occupied = sum(1 for s in spaces if s["status"] == "occupied")
+            reserved = sum(1 for s in spaces if s["status"] == "reserved")
+            empty = sum(1 for s in spaces if s["status"] == "empty")
+
+            # Get detection info for caption
+            detection_result = st.session_state["detection_results"].get(lot_name, {})
+            confidence = detection_result.get("max_conf", 0.0)
+            detection_status = "Occupied" if occupied > 0 else "Empty"
+
+            summaries.append((lot_name, occupied, reserved, empty, detection_status, confidence))
         else:
-            try:
-                orig = Image.open(entry["src_path"]).convert("RGB")
-                st.image(orig, use_container_width=True)
-            except Exception:
-                st.write("Annotated image and original not available.")
+            summaries.append((lot_name, 0, 0, 0, "No data", 0.0))
 
-        # Show per-image summary
-        st.markdown("#### Per-image summary")
-        per_row = {
-            "file": entry["file"],
-            "prediction": entry["prediction"],
-            "max_conf": entry["max_conf"],
-            "num_detections": entry["num_detections"],
-            "classes": entry["classes"]
-        }
-        st.table(pd.DataFrame([per_row]))
+    # Render doughnut charts
+    cols = st.columns(3)
+    for i, (lot_name, occ, res, emp, detection_status, confidence) in enumerate(summaries):
+        fig = go.Figure(data=[go.Pie(
+            labels=["Occupied", "Reserved", "Empty"],
+            values=[occ, res, emp],
+            hole=0.5,
+            marker_colors=['#EF553B', '#FFA15A', '#00CC96']
+        )])
+        fig.update_layout(
+            title_text=f"{lot_name}<br><sub>{detection_status} (max conf: {confidence:.2f})</sub>",
+            showlegend=True
+        )
+        cols[i].plotly_chart(fig, use_container_width=True)
 
-        st.markdown("#### Detections")
-        if entry["detections"]:
-            det_df = pd.DataFrame(entry["detections"])
-            # Beautify class_name column if none
-            if det_df["class_name"].isnull().any() and names:
-                det_df["class_name"] = det_df["class_id"].apply(lambda x: names[int(x)] if int(x) in names else None)
-            st.dataframe(det_df)
-        else:
-            st.write("No detections for this image.")
+    selected_lot = st.selectbox("Select a parking lot:", list(st.session_state["parking_data"].keys()))
+    spaces = st.session_state["parking_data"][selected_lot]["spaces"]
+
+    if not spaces:
+        st.warning("No detection data available yet. Please run detection first.")
+    else:
+        st.subheader(f"Parking Spaces — {selected_lot}")
+
+        detection_info = st.session_state["detection_results"][selected_lot]
+        if detection_info["annotated"] is not None:
+            st.info(f"Latest detection: **{'Occupied' if detection_info['occupied'] else 'Empty'}**, "
+                    f"most confident: {detection_info['max_conf']:.2f}")
+
+        cols = st.columns(4)
+        for i, space in enumerate(spaces):
+            status = space["status"]
+            # Create clear, consistent labels
+            if space["status"] == "occupied":
+                label = f"Space {space['id']} - 🚗 Occupied"
+                if space.get("class_name") and space["conf"] > 0:
+                    label += f" (conf: {space['conf']:.2f})"
+            elif space["status"] == "reserved":
+                label = f"Space {space['id']} - 📋 Reserved"
+            else:  # empty
+                label = f"Space {space['id']} - ✅ Empty"
+
+            # Timer for reserved spots
+            if status == "reserved":
+                end_time = st.session_state["parking_data"][selected_lot]["reservations"].get(space["id"], {}).get("end_time")
+                if end_time:
+                    remaining = (end_time - datetime.now()).total_seconds()
+                    if remaining <= 0:
+                        space["status"] = "empty"
+                        del st.session_state["parking_data"][selected_lot]["reservations"][space["id"]]
+                    else:
+                        mins, secs = divmod(int(remaining), 60)
+                        label += f" ⏱️ {mins:02d}:{secs:02d}"
+
+            with cols[i % 4]:
+                if st.button(label, key=f"{selected_lot}_{space['id']}"):
+                    if space["status"] == "empty":
+                        st.session_state["confirm_reservation"] = (selected_lot, space["id"])
+                    elif space["status"] == "reserved":
+                        st.session_state["selected_reserved"] = (selected_lot, space["id"])
+                    elif space["status"] == "occupied":
+                        st.info("This space is already occupied.")
+
+        # Handle reservation confirmation
+        if "confirm_reservation" in st.session_state:
+            lot, sid = st.session_state["confirm_reservation"]
+            st.warning(f"Reserve Space {sid} in {lot}?")
+            coly, coln = st.columns(2)
+            with coly:
+                if st.button("✅ Yes"):
+                    st.session_state["parking_data"][lot]["spaces"][sid - 1]["status"] = "reserved"
+                    st.session_state["parking_data"][lot]["reservations"][sid] = {
+                        "end_time": datetime.now() + timedelta(minutes=15)
+                    }
+                    del st.session_state["confirm_reservation"]
+                    st.success("Reservation confirmed!")
+                    st.rerun() 
+            with coln:
+                if st.button("❌ No"):
+                    del st.session_state["confirm_reservation"]
+
+        # Handle actions for reserved
+        if "selected_reserved" in st.session_state:
+            lot, sid = st.session_state["selected_reserved"]
+            st.info(f"Space {sid} in {lot} is reserved.")
+            colp, colc = st.columns(2)
+            with colp:
+                if st.button("🚘 Parked"):
+                    st.session_state["parking_data"][lot]["spaces"][sid - 1]["status"] = "occupied"
+                    del st.session_state["parking_data"][lot]["reservations"][sid]
+                    del st.session_state["selected_reserved"]
+                    st.rerun()
+            with colc:
+                if st.button("❌ Cancel"):
+                    st.session_state["parking_data"][lot]["spaces"][sid - 1]["status"] = "empty"
+                    del st.session_state["parking_data"][lot]["reservations"][sid]
+                    del st.session_state["selected_reserved"]
+                    st.rerun()
 
 st.markdown("---")
-st.markdown("**Note:** Occupancy rule: image is 'occupied' when any detection has confidence >= threshold.")
+st.caption("Developed by JD, Mel, Isaiah — Smart Parking Detector and Reservation System 🚗")
+

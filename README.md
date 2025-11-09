@@ -36,17 +36,19 @@ parking-space-detector/
 
 ### 1️⃣ Create a Virtual Environment
 
-```bash
+```
+Windows:
+# bash
 python -m venv venv
-
-# Activate it
-# Windows:
+# To activate it:
 venv\Scripts\activate
 
-# macOS / Linux:
+macOS / Linux:
+# bash
+python3 -m venv venv
+# To activate it:
 source venv/bin/activate
 ```
-
 ---
 
 ### 2️⃣ Install Dependencies
@@ -161,5 +163,5 @@ Otherwise, it is marked **`empty`**.
 - Isaiah John Mariano
 - Meluisa Montealto
 
----
+----
 

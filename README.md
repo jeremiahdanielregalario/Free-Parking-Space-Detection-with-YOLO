@@ -3,6 +3,8 @@
 A Streamlit web app for detecting **empty** and **occupied** parking spaces using a **custom YOLO model** (`.pt`).  
 The app supports single-image and ZIP dataset predictions, displays annotated results, and generates CSV and summary reports.
 
+Online web app: [Free Parking Space Detection](https://free-parking-space-detection.streamlit.app/)
+
 Training Dataset: [Roboflow](https://universe.roboflow.com/muhammad-syihab-bdynf/parking-space-ipm1b/dataset/3)
 
 ---

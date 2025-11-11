@@ -7,6 +7,7 @@ import pandas as pd
 import torch
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+import cv2
 
 MODEL_PATH = "model.pt" 
 
@@ -38,12 +39,60 @@ def results_to_detections(results):
             "xyxy": [float(x) for x in xyxy[i].tolist()]
         })
     return detections
+    
+# Annotating the images
+def draw_numbered_boxes(pil_img, detections):
+    
+    img = np.array(pil_img).copy()
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-def annotate_from_result(results):
-    try:
-        return results.plot()
-    except Exception:
-        return getattr(results, "orig_img", None)
+    # Dynamically adjust font size based on image width
+    img_h, img_w = img.shape[:2]
+    base_font_scale = 2.0
+    font_scale = max(0.8, min(2.5, img_w / 1000 * base_font_scale))  # scales with width
+    thickness = int(font_scale * 2)
+    text_color = (203, 1, 255)  # pink (BGR)
+    border_color = (0, 0, 0)      # black
+
+    for idx, det in enumerate(detections, start=1):
+        x1, y1, x2, y2 = map(int, det["xyxy"])
+        label = str(idx)
+
+        # Box color: green (empty), red (occupied)
+        color = (0, 255, 0) if "empty" in det["class_name"].lower() else (0, 0, 255)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+        # Center text
+        (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        text_x = int(x1 + (x2 - x1 - text_w) / 2)
+        text_y = int(y1 + (y2 - y1 + text_h) / 2)
+
+        # Draw black border first
+        cv2.putText(
+            img,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            border_color,
+            thickness + 2,   # slightly thicker for outline
+            cv2.LINE_AA
+        )
+
+        # Draw pink text on top
+        cv2.putText(
+            img,
+            label,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            text_color,
+            thickness,
+            cv2.LINE_AA
+        )
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(img)
 
 def infer_on_image(model, pil_img):
     img_np = np.array(pil_img)
@@ -53,7 +102,7 @@ def infer_on_image(model, pil_img):
 
     res0 = results[0]
     detections = results_to_detections(res0)
-    annotated = annotate_from_result(res0)
+    annotated = draw_numbered_boxes(pil_img, detections)
 
     # Determine occupancy based on the most confident detection
     max_conf = max([d["conf"] for d in detections], default=0.0)
@@ -129,42 +178,44 @@ with tab1:
                     prev_spaces = st.session_state["parking_data"][lot_name]["spaces"]
                     reservations = st.session_state["parking_data"][lot_name]["reservations"]
 
-                    # First, let's debug what we're detecting
-                    st.write("🔍 DEBUG - What YOLO detected:")
-                    for i, det in enumerate(detections):
-                        st.write(f"Detection {i+1}: Class='{det['class_name']}', Confidence={det['conf']:.2f}")
+                    # Count all detected parking-related objects (cars, empty spaces, etc.)
+                    if detections:
+                        # Each detection corresponds to a space (either empty or occupied)
+                        TOTAL_SPACES = len(detections)
+                    else:
+                        # If nothing detected, keep previous known count (if exists) or default to 0
+                        prev_spaces = st.session_state["parking_data"][lot_name]["spaces"]
+                        TOTAL_SPACES = len(prev_spaces) if prev_spaces else 0
 
-                    # Assume lot has N total spaces
-                    TOTAL_SPACES = 21  # Change this to 21 if you want 21 spaces
                     new_spaces = []
-
-                    # Get previous reservations
                     reservations = st.session_state["parking_data"][lot_name]["reservations"]
 
-                    # Process each detection - respect what was actually detected
+                    # ------------------------------
+                    # Process detected spaces
+                    # ------------------------------
                     for idx, det in enumerate(detections, start=1):
-                        if idx > TOTAL_SPACES:  # Don't exceed total spaces
-                            break
-                            
-                        # Determine status based on WHAT was detected
-                        if "empty" in det["class_name"].lower() or "free" in det["class_name"].lower():
+                        # Determine status based on detection class name
+                        cname = det["class_name"].lower()
+                        if "empty" in cname or "free" in cname:
                             status = "empty"
                         else:
-                            status = "occupied"  # Assume it's a vehicle
+                            status = "occupied"  # assume any other detection = vehicle
                         
                         # Reservations override detection
                         if idx in reservations:
                             status = "reserved"
-                        
+
                         new_spaces.append({
                             "id": idx,
-                            "status": status,  # This now matches the detection
+                            "status": status,
                             "conf": det["conf"],
                             "class_name": det["class_name"]
                         })
 
-                    # Fill remaining spaces as empty
-                    for idx in range(len(detections) + 1, TOTAL_SPACES + 1):
+                    # ------------------------------
+                    # Fill remaining spaces if total increased or none detected
+                    # ------------------------------
+                    for idx in range(len(new_spaces) + 1, TOTAL_SPACES + 1):
                         if idx in reservations:
                             status = "reserved"
                         else:
@@ -176,7 +227,9 @@ with tab1:
                             "class_name": None
                         })
 
-                    # Store everything
+                    # ------------------------------
+                    # Store results in session state
+                    # ------------------------------
                     st.session_state["parking_data"][lot_name]["spaces"] = new_spaces
                     st.session_state["parking_data"][lot_name]["last_detection"] = datetime.now()
                     st.session_state["detection_results"][lot_name] = {
@@ -185,6 +238,7 @@ with tab1:
                         "annotated": annotated,
                         "timestamp": datetime.now()
                     }
+                    st.session_state["parking_data"][lot_name]["annotated_image"] = annotated
 
             # Always show the latest annotated result
             result = st.session_state["detection_results"][lot_name]
@@ -260,16 +314,43 @@ with tab2:
         if detection_info["annotated"] is not None:
             st.info(f"Latest detection: **{'Occupied' if detection_info['occupied'] else 'Empty'}**, "
                     f"most confident: {detection_info['max_conf']:.2f}")
+            
+        # Display Image
+        lot_name = selected_lot  # assuming 'selected_lot' holds the currently selected parking lot name
+        if lot_name in st.session_state["parking_data"]:
+            lot_data = st.session_state["parking_data"][lot_name]
+            if lot_data.get("annotated_image") is not None:
+                st.image(
+                    lot_data["annotated_image"],
+                    caption=f"Detection Image - {lot_name}",
+                    width=400
+                )
+            else:
+                st.warning(f"No uploaded detection image found for {lot_name}.")
+        else:
+            st.warning(f"Lot '{lot_name}' not found in session data.")
+
+        # Reservation
+        user_has_reservation = False
+        reserved_space_info = None
+        for lot_name, data in st.session_state["parking_data"].items():
+            for sid, res_info in data["reservations"].items():
+                # If a space is reserved, we assume it's reserved by "this user/session"
+                user_has_reservation = True
+                reserved_space_info = (lot_name, sid)
+                break
+            if user_has_reservation:
+                break
 
         cols = st.columns(4)
         for i, space in enumerate(spaces):
             status = space["status"]
             # Create clear, consistent labels
-            if space["status"] == "occupied":
+            if status == "occupied":
                 label = f"Space {space['id']} - 🚗 Occupied"
                 if space.get("class_name") and space["conf"] > 0:
                     label += f" (conf: {space['conf']:.2f})"
-            elif space["status"] == "reserved":
+            elif status == "reserved":
                 label = f"Space {space['id']} - 📋 Reserved"
             else:  # empty
                 label = f"Space {space['id']} - ✅ Empty"
@@ -288,11 +369,14 @@ with tab2:
 
             with cols[i % 4]:
                 if st.button(label, key=f"{selected_lot}_{space['id']}"):
-                    if space["status"] == "empty":
-                        st.session_state["confirm_reservation"] = (selected_lot, space["id"])
-                    elif space["status"] == "reserved":
+                    if status == "empty":
+                        if user_has_reservation:
+                            st.warning(f"You already reserved Space {reserved_space_info[1]} in {reserved_space_info[0]}. Cannot reserve another slot.")
+                        else:
+                            st.session_state["confirm_reservation"] = (selected_lot, space["id"])
+                    elif status == "reserved":
                         st.session_state["selected_reserved"] = (selected_lot, space["id"])
-                    elif space["status"] == "occupied":
+                    elif status == "occupied":
                         st.info("This space is already occupied.")
 
         # Handle reservation confirmation
@@ -306,6 +390,7 @@ with tab2:
                     st.session_state["parking_data"][lot]["reservations"][sid] = {
                         "end_time": datetime.now() + timedelta(minutes=15)
                     }
+                    st.session_state["selected_reserved"] = (lot, sid)
                     del st.session_state["confirm_reservation"]
                     st.success("Reservation confirmed!")
                     st.rerun() 
